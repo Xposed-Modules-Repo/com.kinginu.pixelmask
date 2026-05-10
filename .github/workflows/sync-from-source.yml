@@ -1,0 +1,83 @@
+name: Sync release from source
+
+# This repo (Xposed-Modules-Repo/com.kinginu.pixelmask) is a release-only
+# mirror; all source / development lives at github.com/kinginu/PixelMask.
+# Whenever the source repo cuts a release, we want it mirrored here so the
+# LSPosed Manager catalog picks it up.
+#
+# Doing this from the *source* side would need a PAT with Contents: Write on
+# this repo. Fine-grained PATs aren't available because the
+# Xposed-Modules-Repo organization hasn't enabled them, and a Classic PAT
+# with `public_repo` was rejected too. So we flip the direction: this repo's
+# own GITHUB_TOKEN already has write access to itself, so we run the sync
+# *here*. Polls the source repo hourly, no PAT involved.
+
+on:
+  schedule:
+    # Hourly. The submission docs say it can take up to ~10 min for the
+    # LSPosed catalog to pick up a new release after it lands here, so
+    # cumulative latency from source-release to in-Manager visibility is
+    # ≤ 70 min in the worst case.
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Look up latest source release
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view \
+            --repo kinginu/PixelMask \
+            --json tagName,name,body \
+            > release.json
+          tag=$(jq -r .tagName release.json)
+          name=$(jq -r .name release.json)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          jq -r .body release.json > release-body.md
+          echo "source latest: tag=$tag name=$name"
+
+      - name: Skip if mirror already has this tag
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.source.outputs.tag }}" \
+                --repo "${{ github.repository }}" \
+                >/dev/null 2>&1; then
+            echo "should_sync=false" >> "$GITHUB_OUTPUT"
+            echo "tag ${{ steps.source.outputs.tag }} already on mirror — nothing to do"
+          else
+            echo "should_sync=true" >> "$GITHUB_OUTPUT"
+            echo "tag ${{ steps.source.outputs.tag }} not on mirror — will sync"
+          fi
+
+      - name: Download APK from source release
+        if: steps.gate.outputs.should_sync == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p apk
+          gh release download "${{ steps.source.outputs.tag }}" \
+            --repo kinginu/PixelMask \
+            --pattern "*.apk" \
+            --dir apk
+          ls -la apk/
+
+      - name: Create mirror release
+        if: steps.gate.outputs.should_sync == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.source.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.source.outputs.name }}" \
+            --notes-file release-body.md \
+            apk/*.apk
